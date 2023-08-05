@@ -1,155 +1,322 @@
-mod component;
 mod mqtt;
 
-use std::convert::identity;
-
-use component::{
-    about::AboutDialog,
-    connect::ConnectDialog,
-    mqtt_worker::{AsyncHandler, AsyncHandlerMsg},
-};
-use gtk::prelude::*;
-use relm4::{
-    adw, gtk, Component, ComponentController, ComponentParts, ComponentSender, Controller, RelmApp,
-    SimpleComponent, WorkerController,
+use crate::mqtt::connect_mqtt;
+use std::{
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    thread::JoinHandle,
 };
 
-struct App {
-    about_dialog: Controller<AboutDialog>,
-    connect_dialog: Controller<ConnectDialog>,
-    worker: WorkerController<AsyncHandler>,
-    text: String,
-    started: bool,
+use gtk4::{
+    prelude::*, Align, Box, InputPurpose, Orientation, ScrolledWindow, Switch, TextBuffer,
+    TextView, ToggleButton, WrapMode,
+};
+use leptos::*;
+use libadwaita::{
+    traits::{AdwApplicationWindowExt, AdwWindowExt, PreferencesGroupExt},
+    AboutWindow, Application, ApplicationWindow, EntryRow, HeaderBar, PasswordEntryRow,
+    PreferencesGroup, PreferencesWindow,
+};
+
+const APP_ID: &str = "tw.mingchang.mqtt-client";
+
+#[derive(Debug, Default, Clone)]
+pub struct ConnectionInfo {
+    pub url: String,
+    pub topic: Option<String>,
+    pub credentials: Option<ProvidedCredentials>,
 }
 
-#[derive(Debug)]
-pub enum Msg {
-    ShowAboutDialog,
-    ShowConnectDialog,
-    Start(ConnectDialog),
-    Stop,
-    MessageReceived(String),
+#[derive(Debug, Clone, Default)]
+pub struct ProvidedCredentials {
+    pub username: String,
+    pub password: String,
 }
 
-#[relm4::component]
-impl SimpleComponent for App {
-    type Init = ();
-    type Input = Msg;
-    type Output = ();
-
-    view! {
-        #[root]
-        adw::ApplicationWindow {
-            set_vexpand: false,
-            set_hexpand: false,
-            set_overflow: gtk::Overflow::Hidden,
-            #[name = "leaflet"]
-            adw::Leaflet {
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_hexpand: true,
-
-                    #[name = "header"]
-                    adw::HeaderBar {
-                        #[name = "connect_button"]
-                        pack_start = &gtk::Button {
-                            set_icon_name: "list-add-symbolic",
-                            connect_clicked[sender] => move |_| {
-                            sender.input(Msg::Stop);
-                                sender.input(Msg::ShowConnectDialog);
-                            }
-                        },
-
-                        #[wrap(Some)]
-                        set_title_widget = &adw::WindowTitle {
-                            set_title: "MQTT Client",
-                        },
-
-                        #[name = "about_button"]
-                        pack_end = &gtk::Button {
-                            set_icon_name: "help-about-symbolic",
-                            connect_clicked[sender] => move |_| {
-                                sender.input(Msg::ShowAboutDialog);
-                            }
-                        },
-                    },
-                    gtk::ScrolledWindow {
-                        #[wrap(Some)]
-                        #[name = "textview"]
-                        set_child = &gtk::TextView {
-                            set_vexpand: true,
-                            set_editable: false,
-                            set_input_purpose: gtk::InputPurpose::Terminal,
-                            set_overflow: gtk::Overflow::Visible,
-                            set_monospace: true,
-                            set_wrap_mode: gtk::WrapMode::Char,
-                            #[wrap(Some)]
-                            #[name = "buffer"]
-                            set_buffer = &gtk::TextBuffer {
-                                #[watch]
-                                set_text: &model.text,
-                            },
-                        },
-                        connect_vadjustment_notify => move |e| {
-                            println!("connect_vadjustment_notify, {e:?}");
-                        }
-                    },
-                },
-            }
-        }
-    }
-
-    fn init(
-        _: Self::Init,
-        root: &Self::Root,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
-        let about_dialog = AboutDialog::builder()
-            .transient_for(root)
-            .launch(())
-            .detach();
-        let connect_dialog = ConnectDialog::builder()
-            .transient_for(root)
-            .launch(())
-            .forward(sender.input_sender(), identity);
-        let model = App {
-            about_dialog,
-            connect_dialog,
-            worker: AsyncHandler::builder()
-                .detach_worker(())
-                .forward(sender.input_sender(), identity),
-            text: String::new(),
-            started: false,
-        };
-        let widgets = view_output!();
-        ComponentParts { model, widgets }
-    }
-
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
-        match msg {
-            Msg::ShowAboutDialog => self.about_dialog.sender().send(()).unwrap(),
-            Msg::ShowConnectDialog => self.connect_dialog.widget().present(),
-            Msg::Start(new_setting) => {
-                self.worker.emit(AsyncHandlerMsg::Start(new_setting));
-                self.started = true;
-                self.text = String::new();
-            }
-            Msg::Stop => {
-                self.worker.emit(AsyncHandlerMsg::Stop);
-                self.started = false;
-            }
-            Msg::MessageReceived(message) => {
-                self.text = if self.text.is_empty() {
-                    message
-                } else {
-                    format!("{}\n\n{message}", self.text)
-                };
-            }
-        }
-    }
-}
-
+static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static THREAD_STOP: AtomicBool = AtomicBool::new(false);
 fn main() {
-    let app = RelmApp::new("tw.mingchang.mqtt-client");
-    app.run::<App>(());
+    _ = create_scope(create_runtime(), |cx| {
+        let app = Application::builder().application_id(APP_ID).build();
+        app.connect_activate(move |app| {
+            let connection_info = create_rw_signal(cx, ConnectionInfo::default());
+            let connection = create_rw_signal(cx, false);
+
+            let window = Rc::new(
+                ApplicationWindow::builder()
+                    .title("MQTT Client")
+                    .application(app)
+                    .default_width(1000)
+                    .default_height(600)
+                    .build(),
+            );
+
+            let content = Box::new(Orientation::Vertical, 0);
+            content.append(&header_bar(cx, app, &window, connection_info, connection));
+            content.append(&main_ui(cx, app, connection_info, connection));
+            window.set_content(Some(&content));
+            window.present();
+        });
+        app.run();
+    });
+}
+
+fn header_bar(
+    cx: Scope,
+    _app: &Application,
+    window: &ApplicationWindow,
+    connection_info: RwSignal<ConnectionInfo>,
+    connection: RwSignal<bool>,
+) -> HeaderBar {
+    let header_bar = HeaderBar::new();
+
+    let add_button = ToggleButton::new();
+    add_button.connect_clicked({
+        let window = window.clone();
+        move |e| {
+            e.set_active(false);
+            if connection.get_untracked() {
+                THREAD_STOP.store(true, Ordering::Relaxed);
+                if let Ok(mut handle_option) = THREAD.try_lock() {
+                    loop {
+                        if handle_option
+                            .as_ref()
+                            .map_or_else(|| false, |handle| handle.is_finished())
+                        {
+                            connection.set(false);
+                            connection_info.set(ConnectionInfo::default());
+                            *handle_option = None;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                connect_window(cx, &window, connection_info, connection).present();
+            }
+        }
+    });
+
+    create_effect(cx, {
+        let add_button = add_button.clone();
+        move |_| {
+            if connection.get() {
+                add_button.set_icon_name("media-playback-stop");
+            } else {
+                add_button.set_icon_name("list-add-symbolic");
+            }
+        }
+    });
+
+    let about_button = ToggleButton::new();
+    about_button.set_icon_name("help-about-symbolic");
+    about_button.connect_clicked({
+        let window = window.clone();
+        move |e| {
+            e.set_active(false);
+            about_window(&window).present()
+        }
+    });
+
+    header_bar.pack_start(&add_button);
+    header_bar.pack_end(&about_button);
+    header_bar
+}
+
+fn main_ui(
+    cx: Scope,
+    _app: &Application,
+    connection_info: RwSignal<ConnectionInfo>,
+    connection: RwSignal<bool>,
+) -> Box {
+    let main_box = Box::builder().vexpand(true).hexpand(true).build();
+
+    let scrolled_view = ScrolledWindow::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    let text_buffer = TextBuffer::default();
+    let text_view = TextView::builder()
+        .monospace(true)
+        .wrap_mode(WrapMode::Char)
+        .buffer(&text_buffer)
+        .build();
+    scrolled_view.set_child(Some(&text_view));
+
+    create_effect(cx, {
+        let text_buffer = text_buffer.clone();
+        move |_| {
+            text_buffer.set_text(&format!(
+                "{:#?}\n\n{:#?}",
+                connection_info.get(),
+                connection.get()
+            ))
+        }
+    });
+
+    main_box.append(&scrolled_view);
+    main_box
+}
+
+fn about_window(parent: &ApplicationWindow) -> AboutWindow {
+    AboutWindow::builder()
+        .application_icon("application-x-executable-symbolic")
+        .application_name("MQTT Client")
+        .comments("A MQTT Client with GTK4 GUI support.")
+        .website("https://mingchang.tw")
+        .version("0.3.0")
+        .copyright("© 2023 Ming Chang")
+        .developers(vec![String::from("Ming Chang")])
+        .designers(vec![String::from("Ming Chang")])
+        .modal(true)
+        .transient_for(parent)
+        .build()
+}
+
+fn connect_window(
+    cx: Scope,
+    parent: &ApplicationWindow,
+    connection_info: RwSignal<ConnectionInfo>,
+    connection: RwSignal<bool>,
+) -> PreferencesWindow {
+    let window = PreferencesWindow::builder()
+        .title("Connect to MQTT Server")
+        .default_width(400)
+        .default_height(500)
+        .transient_for(parent)
+        .modal(true)
+        .build();
+
+    let window_content = Box::new(Orientation::Vertical, 0);
+    let content = Box::builder()
+        .margin_top(20)
+        .margin_bottom(20)
+        .margin_start(20)
+        .margin_end(20)
+        .spacing(20)
+        .orientation(Orientation::Vertical)
+        .build();
+
+    let header_bar = HeaderBar::new();
+
+    let cancel_button = ToggleButton::builder().label("Cancel").build();
+    cancel_button.connect_clicked({
+        let window = window.clone();
+        move |_| window.destroy()
+    });
+    let submit_button = ToggleButton::builder().label("Connect").build();
+    submit_button.connect_clicked({
+        let window = window.clone();
+        move |_| {
+            let connection_info = connection_info.get_untracked();
+            if let Ok(mut writer) = THREAD.try_lock() {
+                writer.replace(std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async { connect_mqtt(connection_info).await })
+                }));
+                connection.set(true);
+            }
+            window.destroy();
+        }
+    });
+
+    header_bar.pack_start(&cancel_button);
+    header_bar.pack_end(&submit_button);
+
+    window_content.append(&header_bar);
+
+    let info_preferences_group = PreferencesGroup::builder().title("Connection Info").build();
+    let connect_dialog_url = EntryRow::builder()
+        .title("URL")
+        .input_purpose(InputPurpose::Url)
+        .build();
+    connect_dialog_url
+        .connect_changed(move |e| connection_info.update(|old| old.url = e.text().to_string()));
+    let connect_dialog_topic = EntryRow::builder().title("Topic (Optional)").build();
+    connect_dialog_topic.connect_changed(move |e| {
+        connection_info.update(|old| {
+            old.topic = if !e.text().is_empty() {
+                Some(e.text().to_string())
+            } else {
+                None
+            }
+        })
+    });
+    info_preferences_group.add(&connect_dialog_url);
+    info_preferences_group.add(&connect_dialog_topic);
+    content.append(&info_preferences_group);
+
+    let credential_preferences_group = PreferencesGroup::builder()
+        .title("Credentials")
+        .description("Optional")
+        .build();
+
+    let credential_state = create_rw_signal(cx, false);
+    let credential_toggle = Switch::builder().state(false).valign(Align::Center).build();
+    credential_toggle.connect_state_notify(move |e| credential_state.set(e.state()));
+    credential_preferences_group.set_header_suffix(Some(&credential_toggle));
+
+    let connect_dialog_username = EntryRow::builder()
+        .title("Username")
+        .sensitive(false)
+        .build();
+    connect_dialog_username.connect_changed(move |e| {
+        connection_info.update(|old| {
+            let new_credentials = ProvidedCredentials {
+                username: e.text().to_string(),
+                password: old
+                    .credentials
+                    .clone()
+                    .map_or_else(String::default, |credential| credential.password),
+            };
+            old.credentials = Some(new_credentials);
+        })
+    });
+    credential_preferences_group.add(&connect_dialog_username);
+
+    let connect_dialog_password = PasswordEntryRow::builder()
+        .title("Password")
+        .sensitive(false)
+        .input_purpose(InputPurpose::Password)
+        .build();
+    connect_dialog_password.connect_changed(move |e| {
+        connection_info.update(|old| {
+            let new_credentials = ProvidedCredentials {
+                username: old
+                    .credentials
+                    .clone()
+                    .map_or_else(String::default, |credential| credential.username),
+                password: e.text().to_string(),
+            };
+            old.credentials = Some(new_credentials);
+        })
+    });
+    credential_preferences_group.add(&connect_dialog_password);
+
+    create_effect(cx, {
+        let connect_dialog_username = connect_dialog_username.clone();
+        let connect_dialog_password = connect_dialog_password.clone();
+        move |_| {
+            let state = credential_state.get();
+            if !state {
+                connect_dialog_username.set_text("");
+                connect_dialog_password.set_text("");
+                connection_info.update(|old| old.credentials = None);
+            }
+            connect_dialog_username.set_sensitive(state);
+            connect_dialog_password.set_sensitive(state);
+        }
+    });
+
+    content.append(&credential_preferences_group);
+
+    window_content.append(&content);
+
+    window.set_content(Some(&window_content));
+    window
 }

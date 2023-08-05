@@ -1,18 +1,19 @@
-use std::{collections::HashMap, process::exit, sync::{Arc, mpsc::{Receiver, TryRecvError}}, time::Duration};
+use futures_util::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{from_str, Value};
+use std::{
+    collections::HashMap,
+    process::exit,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+use tokio::sync::RwLock;
 
-use futures_util::StreamExt;
 use paho_mqtt::{
     properties, AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, PropertyCode,
 };
-use relm4::ComponentSender;
-use serde::{Deserialize, Serialize};
-use serde_json::{from_str, Value};
-use tokio::sync::RwLock;
 
-use crate::component::{
-    connect::{ConnectDialog, Credentials},
-    mqtt_worker::{AsyncHandler, AsyncHandlerMsg},
-};
+use crate::{ConnectionInfo, THREAD_STOP};
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
@@ -22,25 +23,19 @@ enum InnerValue {
     JsonArray(Vec<HashMap<String, Value>>),
 }
 
-pub async unsafe fn mqtt_connection(
-    connection_info: ConnectDialog,
-    sender: ComponentSender<AsyncHandler>,
-    rx: Receiver<()>
-) {
+pub async fn connect_mqtt(connection_info: ConnectionInfo) {
     let data_map_lock: Arc<RwLock<HashMap<String, InnerValue>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
     let create_options = CreateOptionsBuilder::new()
-        .server_uri(connection_info.url.clone())
+        .server_uri(&connection_info.url)
         .client_id("")
         .finalize();
 
     let mut client = match AsyncClient::new(create_options) {
         Ok(client) => client,
         Err(error) => {
-            sender.input(AsyncHandlerMsg::MessageReceived(format!(
-                "Error when creating async client: {error}."
-            )));
+            eprintln!("Error when creating async client: {}.", error);
             exit(1)
         }
     };
@@ -52,54 +47,43 @@ pub async unsafe fn mqtt_connection(
     connect_options.properties(properties![PropertyCode::SessionExpiryInterval => 3600]);
     connect_options.clean_session(true);
 
-    if let Credentials::Yes(credentials) = connection_info.credentials {
-        connect_options.user_name(credentials.username);
-        connect_options.password(credentials.password);
+    if let Some(credential) = connection_info.credentials {
+        connect_options.user_name(credential.username);
+        connect_options.password(credential.password);
     }
 
     let built_connect_options = connect_options.finalize();
 
     if let Err(error) = client.connect(built_connect_options).await {
-        sender.input(AsyncHandlerMsg::MessageReceived(format!(
-            "[ERROR] MQTT connection failed: {error}."
-        )));
+        eprintln!("[ERROR] MQTT connection failed: {}.", error);
         exit(1)
     }
 
     match client
-        .subscribe(
-            connection_info
-                .topic
-                .clone()
-                .unwrap_or_else(|| "#".to_string()),
-            1,
-        )
+        .subscribe(connection_info.topic.clone().unwrap_or("#".to_owned()), 1)
         .await
     {
         Err(error) => {
-            sender.input(AsyncHandlerMsg::MessageReceived(format!(
-                "[ERROR] Failed to subscribe topic: {error}."
-            )));
+            eprintln!("[ERROR] Failed to subscribe topic: {}.", error);
             exit(1)
         }
-        _ => {
-            sender.input(AsyncHandlerMsg::MessageReceived(format!(
-                "[INFO] Connected to {} with topic \"{}\".",
-                connection_info.url,
-                connection_info.topic.unwrap_or_else(|| "#".to_owned())
-            )));
-        }
+        _ => eprintln!(
+            "[INFO] Connected to {} with topic \"{}\".",
+            connection_info.url,
+            connection_info.topic.unwrap_or("#".to_owned())
+        ),
     };
     let data_map_lock_cloned = data_map_lock.clone();
 
     while let Some(message_option) = stream.next().await {
+        if THREAD_STOP.load(Ordering::Relaxed) {
+            eprintln!("[INFO] THREAD_STOP received.");
+            break;
+        }
         if let Some(message) = message_option {
             let topic = message.topic().to_owned();
             let payload = (*String::from_utf8_lossy(message.payload())).to_owned();
-            sender.input(AsyncHandlerMsg::MessageReceived(format!(
-                "[{}]\n{}",
-                &topic, &payload
-            )));
+            eprintln!("[{}]\n{}\n\n", &topic, &payload);
             if payload.starts_with('[') {
                 if let Ok(deserialized_data) = from_str::<Vec<HashMap<String, Value>>>(&payload) {
                     data_map_lock_cloned
@@ -124,15 +108,7 @@ pub async unsafe fn mqtt_connection(
                     .insert(topic, InnerValue::String(payload));
             }
         } else {
-            sender.input(AsyncHandlerMsg::MessageReceived(
-                "[WARN] No message from the stream.".to_string(),
-            ));
-        }
-        match rx.try_recv() {
-            Ok(_) | Err(TryRecvError::Disconnected) => {
-                break;
-            }
-            Err(TryRecvError::Empty) => {}
+            eprintln!("[WARN] No message from the stream.");
         }
     }
 }
