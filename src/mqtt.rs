@@ -1,19 +1,17 @@
 use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, Value};
+use serde_json::Value;
 use std::{
     collections::HashMap,
-    process::exit,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, mpsc::Sender},
     time::Duration,
 };
-use tokio::sync::RwLock;
 
 use paho_mqtt::{
     properties, AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, PropertyCode,
 };
 
-use crate::{ConnectionInfo, THREAD_STOP};
+use crate::{ConnectionInfo, Message, THREAD_STOP};
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
@@ -23,10 +21,7 @@ enum InnerValue {
     JsonArray(Vec<HashMap<String, Value>>),
 }
 
-pub async fn connect_mqtt(connection_info: ConnectionInfo) {
-    let data_map_lock: Arc<RwLock<HashMap<String, InnerValue>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-
+pub async fn connect_mqtt(tx: Sender<Message>, connection_info: ConnectionInfo) -> Result<(), ()> {
     let create_options = CreateOptionsBuilder::new()
         .server_uri(&connection_info.url)
         .client_id("")
@@ -35,8 +30,12 @@ pub async fn connect_mqtt(connection_info: ConnectionInfo) {
     let mut client = match AsyncClient::new(create_options) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("Error when creating async client: {}.", error);
-            exit(1)
+            tx.send(Message::Message(format!(
+                "Error when creating async client: {}.",
+                error
+            )))
+            .ok();
+            return Err(());
         }
     };
 
@@ -55,8 +54,12 @@ pub async fn connect_mqtt(connection_info: ConnectionInfo) {
     let built_connect_options = connect_options.finalize();
 
     if let Err(error) = client.connect(built_connect_options).await {
-        eprintln!("[ERROR] MQTT connection failed: {}.", error);
-        exit(1)
+        tx.send(Message::Message(format!(
+            "[ERROR] MQTT connection failed: {}.",
+            error
+        )))
+        .ok();
+        return Err(());
     }
 
     match client
@@ -64,51 +67,39 @@ pub async fn connect_mqtt(connection_info: ConnectionInfo) {
         .await
     {
         Err(error) => {
-            eprintln!("[ERROR] Failed to subscribe topic: {}.", error);
-            exit(1)
+            tx.send(Message::Message(format!(
+                "[ERROR] Failed to subscribe topic: {}.",
+                error
+            )))
+            .ok();
+            return Err(());
         }
-        _ => eprintln!(
-            "[INFO] Connected to {} with topic \"{}\".",
-            connection_info.url,
-            connection_info.topic.unwrap_or("#".to_owned())
-        ),
+        _ => {
+            tx.send(Message::Message(format!(
+                "[INFO] Connected to {} with topic \"{}\".",
+                connection_info.url,
+                connection_info.topic.clone().unwrap_or("#".to_owned())
+            )))
+            .ok();
+        }
     };
-    let data_map_lock_cloned = data_map_lock.clone();
-
     while let Some(message_option) = stream.next().await {
         if THREAD_STOP.load(Ordering::Relaxed) {
-            eprintln!("[INFO] THREAD_STOP received.");
+            tx.send(Message::Message("[INFO] THREAD_STOP received.".to_string()))
+                .ok();
             break;
         }
-        if let Some(message) = message_option {
-            let topic = message.topic().to_owned();
-            let payload = (*String::from_utf8_lossy(message.payload())).to_owned();
-            eprintln!("[{}]\n{}\n\n", &topic, &payload);
-            if payload.starts_with('[') {
-                if let Ok(deserialized_data) = from_str::<Vec<HashMap<String, Value>>>(&payload) {
-                    data_map_lock_cloned
-                        .write()
-                        .await
-                        .insert(topic, InnerValue::JsonArray(deserialized_data));
-                } else {
-                    data_map_lock_cloned
-                        .write()
-                        .await
-                        .insert(topic, InnerValue::String(payload));
-                };
-            } else if let Ok(deserialized_data) = from_str::<HashMap<String, Value>>(&payload) {
-                data_map_lock_cloned
-                    .write()
-                    .await
-                    .insert(topic, InnerValue::Json(deserialized_data));
-            } else {
-                data_map_lock_cloned
-                    .write()
-                    .await
-                    .insert(topic, InnerValue::String(payload));
-            }
+        if let Some(mqtt_message) = message_option {
+            let topic = mqtt_message.topic().to_owned();
+            let payload = (*String::from_utf8_lossy(mqtt_message.payload())).to_owned();
+            tx.send(Message::Message(format!("[{}]\n{}\n\n", &topic, &payload)))
+                .ok();
         } else {
-            eprintln!("[WARN] No message from the stream.");
+            tx.send(Message::Message(
+                "[WARN] No message from the stream.".to_string(),
+            ))
+            .ok();
         }
     }
+    Ok(())
 }

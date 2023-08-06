@@ -3,7 +3,7 @@ name = "mqtt-client"
 version = "0.3.0"
 edition = "2021"
 authors = ["Ming Chang <mail@mingchang.tw>"]
-description = "mqtt-client - A MQTT Client"
+description = "A MQTT Client with GTK4 GUI support."
 repository = "https://github.com/ming900518/mqtt-client"
 keywords = ["cli", "mqtt"]
 categories = ["gui"]
@@ -26,3 +26,14 @@ libadwaita = { version = "*", features = ["v1_3"] }
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[package.metadata.bundle]
+name = "MQTT Client"
+identifier = "tw.mingchang.mqtt-client"
+version = "0.3.0"
+category = "Developer Tool"
+short_description = "A MQTT Client with GTK4 GUI support."
+long_description = """
+A MQTT Client with GTK4 GUI support.
+"""
+osx_url_schemes = ["mqtt-client"]

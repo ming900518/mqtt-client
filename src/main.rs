@@ -8,11 +8,13 @@ use std::{
         Mutex,
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use gtk4::{
-    prelude::*, Align, Box, InputPurpose, Orientation, ScrolledWindow, Switch, TextBuffer,
-    TextView, ToggleButton, WrapMode,
+    gdk::Display,
+    glib::ControlFlow, prelude::*, Align, Box, CssProvider, InputPurpose, Orientation,
+    ScrolledWindow, Switch, TextBuffer, TextView, ToggleButton, WrapMode, style_context_add_provider_for_display, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use leptos::*;
 use libadwaita::{
@@ -36,11 +38,28 @@ pub struct ProvidedCredentials {
     pub password: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum Message {
+    Message(String),
+    Stop,
+}
+
 static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 static THREAD_STOP: AtomicBool = AtomicBool::new(false);
 fn main() {
     _ = create_scope(create_runtime(), |cx| {
         let app = Application::builder().application_id(APP_ID).build();
+        app.connect_startup(|_| {
+            let provider = CssProvider::new();
+            provider.load_from_data(include_str!("style.css"));
+
+            // Add the provider to the default screen
+            style_context_add_provider_for_display(
+                &Display::default().expect("Could not connect to a display."),
+                &provider,
+                STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
         app.connect_activate(move |app| {
             let connection_info = create_rw_signal(cx, ConnectionInfo::default());
             let connection = create_rw_signal(cx, false);
@@ -54,9 +73,18 @@ fn main() {
                     .build(),
             );
 
+            let text_buffer = TextBuffer::default();
+
             let content = Box::new(Orientation::Vertical, 0);
-            content.append(&header_bar(cx, app, &window, connection_info, connection));
-            content.append(&main_ui(cx, app, connection_info, connection));
+            content.append(&header_bar(
+                cx,
+                app,
+                &window,
+                connection_info,
+                connection,
+                text_buffer.clone(),
+            ));
+            content.append(&main_ui(cx, app, text_buffer));
             window.set_content(Some(&content));
             window.present();
         });
@@ -70,12 +98,14 @@ fn header_bar(
     window: &ApplicationWindow,
     connection_info: RwSignal<ConnectionInfo>,
     connection: RwSignal<bool>,
+    text_buffer: TextBuffer,
 ) -> HeaderBar {
     let header_bar = HeaderBar::new();
 
     let add_button = ToggleButton::new();
     add_button.connect_clicked({
         let window = window.clone();
+        let text_buffer = text_buffer.clone();
         move |e| {
             e.set_active(false);
             if connection.get_untracked() {
@@ -94,7 +124,14 @@ fn header_bar(
                     }
                 }
             } else {
-                connect_window(cx, &window, connection_info, connection).present();
+                connect_window(
+                    cx,
+                    &window,
+                    connection_info,
+                    connection,
+                    text_buffer.clone(),
+                )
+                .present();
             }
         }
     });
@@ -125,36 +162,20 @@ fn header_bar(
     header_bar
 }
 
-fn main_ui(
-    cx: Scope,
-    _app: &Application,
-    connection_info: RwSignal<ConnectionInfo>,
-    connection: RwSignal<bool>,
-) -> Box {
+fn main_ui(_cx: Scope, _app: &Application, text_buffer: TextBuffer) -> Box {
     let main_box = Box::builder().vexpand(true).hexpand(true).build();
 
     let scrolled_view = ScrolledWindow::builder()
         .vexpand(true)
         .hexpand(true)
         .build();
-    let text_buffer = TextBuffer::default();
     let text_view = TextView::builder()
         .monospace(true)
         .wrap_mode(WrapMode::Char)
+        .overwrite(false)
         .buffer(&text_buffer)
         .build();
     scrolled_view.set_child(Some(&text_view));
-
-    create_effect(cx, {
-        let text_buffer = text_buffer.clone();
-        move |_| {
-            text_buffer.set_text(&format!(
-                "{:#?}\n\n{:#?}",
-                connection_info.get(),
-                connection.get()
-            ))
-        }
-    });
 
     main_box.append(&scrolled_view);
     main_box
@@ -180,6 +201,7 @@ fn connect_window(
     parent: &ApplicationWindow,
     connection_info: RwSignal<ConnectionInfo>,
     connection: RwSignal<bool>,
+    text_buffer: TextBuffer,
 ) -> PreferencesWindow {
     let window = PreferencesWindow::builder()
         .title("Connect to MQTT Server")
@@ -210,6 +232,7 @@ fn connect_window(
     submit_button.connect_clicked({
         let window = window.clone();
         move |_| {
+            let (tx, rx) = std::sync::mpsc::channel::<Message>();
             let connection_info = connection_info.get_untracked();
             if let Ok(mut writer) = THREAD.try_lock() {
                 writer.replace(std::thread::spawn(move || {
@@ -217,10 +240,21 @@ fn connect_window(
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(async { connect_mqtt(connection_info).await })
+                        .block_on(async {
+                            connect_mqtt(tx, connection_info).await.ok();
+                        });
                 }));
-                connection.set(true);
             }
+            let text_buffer = text_buffer.clone();
+            gtk4::glib::timeout_add_local(Duration::from_millis(10), move || {
+                if let Ok(Message::Message(mqtt_message)) = rx.recv() {
+                    text_buffer.insert(&mut text_buffer.iter_at_offset(0), &mqtt_message);
+                    ControlFlow::Continue
+                } else {
+                    ControlFlow::Break
+                }
+            });
+            connection.set(true);
             window.destroy();
         }
     });
