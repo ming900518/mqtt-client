@@ -2,3 +2,7 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "Helvetica", "Apple Color Emoji",
         "Segoe UI Emoji";
 }
+
+textview {
+    font-family: monospace;
+}

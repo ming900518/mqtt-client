@@ -12,9 +12,9 @@ use std::{
 };
 
 use gtk4::{
-    gdk::Display,
-    glib::ControlFlow, prelude::*, Align, Box, CssProvider, InputPurpose, Orientation,
-    ScrolledWindow, Switch, TextBuffer, TextView, ToggleButton, WrapMode, style_context_add_provider_for_display, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    gdk::Display, glib::ControlFlow, prelude::*, style_context_add_provider_for_display, Align,
+    Box, CssProvider, InputPurpose, Orientation, ScrolledWindow, Switch, TextBuffer, TextView,
+    ToggleButton, WrapMode, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use leptos::*;
 use libadwaita::{
@@ -246,9 +246,11 @@ fn connect_window(
                 }));
             }
             let text_buffer = text_buffer.clone();
-            gtk4::glib::timeout_add_local(Duration::from_millis(10), move || {
-                if let Ok(Message::Message(mqtt_message)) = rx.recv() {
-                    text_buffer.insert(&mut text_buffer.iter_at_offset(0), &mqtt_message);
+            gtk4::glib::timeout_add_local(Duration::from_millis(50), move || {
+                if connection.get_untracked() {
+                    if let Ok(Message::Message(mqtt_message)) = rx.recv() {
+                        text_buffer.insert(&mut text_buffer.iter_at_offset(0), &mqtt_message);
+                    }
                     ControlFlow::Continue
                 } else {
                     ControlFlow::Break
