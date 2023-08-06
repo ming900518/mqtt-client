@@ -6,9 +6,9 @@ A MQTT Client with GTK4 GUI support.
 
 ## Features
 
-[x] GTK UI  
-[x] Connect to MQTT server  
-[x] View plain text result  
-[] Group result with tree structure  
-[] Graph  
-[] Search result
+- [x] GTK UI  
+- [x] Connect to MQTT server  
+- [x] View plain text result  
+- [ ] Group result with tree structure  
+- [ ] Graph  
+- [ ] Search result
